@@ -14,7 +14,14 @@ Beim Öffnen der Bank erscheint das QuickBank-Fenster automatisch: links die Ban
 
 - **Shift-Linksklick** oder **Rechtsklick** auf ein Item: Item auf die andere Seite verschieben
 - **„Alle >> Bank“ / „Alle >> Inventar“**: die ganze Kategorie verschieben
+- **Suche**: filtert beide Seiten nach Item-Namen; „Treffer >>“ verschiebt alle Treffer
+- Beim Verschieben werden vorhandene Teilstapel automatisch aufgefüllt
 - Fenster per Drag verschieben, **ESC** schließt es
+
+### Regeln
+
+Über **„Regeln“** (oder `/qb regeln`) legst du eigene Regeln an: Name, Richtung (Bank / Inventar) und beliebige Item-Typen.
+**„Aufräumen“** wendet alle aktiven Regeln auf einmal an, einzelne Regeln lassen sich auch direkt ausführen.
 
 ### Befehle
 
@@ -22,4 +29,5 @@ Beim Öffnen der Bank erscheint das QuickBank-Fenster automatisch: links die Ban
 |---|---|
 | `/qb` oder `/quickbank` | Fenster ein-/ausblenden |
 | `/qb auto` | Automatisches Öffnen an der Bank an/aus |
+| `/qb regeln` | Regel-Fenster öffnen |
 | `/qb reset` | Fensterposition zurücksetzen |

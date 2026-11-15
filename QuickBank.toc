@@ -2,7 +2,7 @@
 ## Title: QuickBank
 ## Notes: Eigenes Fenster zum schnellen Verschieben von Items zwischen Inventar und Bank (einzeln oder nach Kategorie).
 ## Author: Kevin
-## Version: 0.2.0
+## Version: 0.3.0
 ## SavedVariables: QuickBankDB
 
 QuickBank.lua

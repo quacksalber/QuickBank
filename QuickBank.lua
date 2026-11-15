@@ -9,8 +9,9 @@ local PANEL_W = COLS * (SIZE + PAD)
 local PREFIX = "|cff33ff99QuickBank|r: "
 
 local bankOpen = false
-local frame, invPanel, bankPanel
+local frame, invPanel, bankPanel, rulesFrame
 local Refresh
+local searchText = ""
 
 local function Print(msg) print(PREFIX .. msg) end
 
@@ -54,10 +55,10 @@ local function BankBags()
 end
 
 local GetInstant = (C_Item and C_Item.GetItemInfoInstant) or GetItemInfoInstant
+local GetFullInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
 local GetClassInfo = (C_Item and C_Item.GetItemClassInfo) or GetItemClassInfo
-local GetQualityColor = (C_Item and C_Item.GetItemQualityColor) or GetItemQualityColor
-
 local GetSubClassInfo = (C_Item and C_Item.GetItemSubClassInfo) or GetItemSubClassInfo
+local GetQualityColor = (C_Item and C_Item.GetItemQualityColor) or GetItemQualityColor
 
 local TRADEGOODS = (Enum.ItemClass and Enum.ItemClass.Tradegoods) or 7
 local MAT_BASE = 100000 -- Gruppenschlüssel für Materialien: MAT_BASE + subclassID
@@ -121,6 +122,37 @@ local function GroupLess(a, b)
     return ClassName(a) < ClassName(b)
 end
 
+-- Alle auswählbaren Item-Typen (für die Regeln)
+local typeList
+local function AllTypeKeys()
+    if typeList then return typeList end
+    typeList = {}
+    local seen = {}
+    local function add(key)
+        if not seen[key] then
+            seen[key] = true
+            typeList[#typeList + 1] = key
+        end
+    end
+    if Enum.ItemClass then
+        for enumName, id in pairs(Enum.ItemClass) do
+            if id ~= TRADEGOODS and not enumName:find("Obsolete")
+                and GetClassInfo and GetClassInfo(id) then
+                add(id)
+            end
+        end
+    else
+        for id = 0, 19 do
+            if id ~= TRADEGOODS and GetClassInfo and GetClassInfo(id) then add(id) end
+        end
+    end
+    for sub = 0, 19 do
+        if GetSubClassInfo and GetSubClassInfo(TRADEGOODS, sub) then add(MAT_BASE + sub) end
+    end
+    table.sort(typeList, GroupLess)
+    return typeList
+end
+
 local function CountFree(bags)
     local n = 0
     for _, bag in ipairs(bags) do
@@ -130,24 +162,76 @@ local function CountFree(bags)
     return n
 end
 
+local function MaxStack(itemID)
+    if C_Item and C_Item.GetItemMaxStackSizeByID then
+        local s = C_Item.GetItemMaxStackSizeByID(itemID)
+        if s then return s end
+    end
+    local s = GetFullInfo and select(8, GetFullInfo(itemID))
+    return s or 1
+end
+
+---------------------------------------------------------------------------
+-- Suche
+---------------------------------------------------------------------------
+
+local function MatchesSearch(info)
+    if searchText == "" then return true end
+    local name = info.hyperlink and info.hyperlink:match("%[(.-)%]")
+    return name ~= nil and name:lower():find(searchText, 1, true) ~= nil
+end
+
 ---------------------------------------------------------------------------
 -- Verschiebe-Warteschlange (ein Item nach dem anderen, wartet auf den Server)
 ---------------------------------------------------------------------------
 
-local queue, reserved, badBags = {}, {}, {}
+local queue, queued, reserved, badBags, badSlots = {}, {}, {}, {}, {}
 local current, ticker
 
 local function Key(bag, slot) return bag .. ":" .. slot end
 
 local function StopQueue()
     wipe(queue)
+    wipe(queued)
     current = nil
     if ticker then ticker:Cancel(); ticker = nil end
 end
 
-local function FindFreeSlot(toBank)
+local function Push(job, front)
+    queued[Key(job.bag, job.slot)] = true
+    if front then table.insert(queue, 1, job) else queue[#queue + 1] = job end
+end
+
+local function Pop()
+    local job = table.remove(queue, 1)
+    if job then queued[Key(job.bag, job.slot)] = nil end
+    return job
+end
+
+-- Ziel suchen: zuerst einen Teilstapel desselben Items auffüllen, sonst einen freien Slot.
+-- Rückgabe: bag, slot, room (room = Platz im Teilstapel, nil bei freiem Slot)
+local function FindTarget(toBank, itemID)
     local now = GetTime()
-    for _, bag in ipairs(toBank and BankBags() or InventoryBags()) do
+    local bags = toBank and BankBags() or InventoryBags()
+
+    local max = MaxStack(itemID)
+    if max > 1 then
+        for _, bag in ipairs(bags) do
+            if not badBags[bag] then
+                for slot = 1, C.GetContainerNumSlots(bag) do
+                    local k = Key(bag, slot)
+                    local info = C.GetContainerItemInfo(bag, slot)
+                    if info and info.itemID == itemID and not info.isLocked
+                        and (info.stackCount or 1) < max
+                        and not badSlots[k] and not (reserved[k] and reserved[k] > now) then
+                        return bag, slot, max - (info.stackCount or 1)
+                    end
+                end
+            end
+        end
+    end
+
+    for _, bag in ipairs(bags) do
         local free, family = C.GetContainerNumFreeSlots(bag)
         if not badBags[bag] and (family or 0) == 0 and (free or 0) > 0 then
             for slot = 1, C.GetContainerNumSlots(bag) do
@@ -165,20 +249,31 @@ local function Step()
 
     if current then
         local info = C.GetContainerItemInfo(current.bag, current.slot)
-        if info and info.itemID == current.itemID and GetTime() < current.deadline then
+        local same = info and info.itemID == current.itemID
+        if same and (info.isLocked or info.stackCount == current.count) and GetTime() < current.deadline then
             return -- Server hat den letzten Zug noch nicht bestätigt
         end
+        local done = current
         current = nil
+        reserved[done.dest] = nil
+        -- Nur ein Teil passte in den Ziel-Stapel: Rest erneut einreihen
+        if same and done.partial and (info.stackCount or 0) < done.count then
+            Push(done, true)
+        end
     end
 
-    local job = table.remove(queue, 1)
+    local job = Pop()
     if not job then StopQueue() return end
 
     local info = C.GetContainerItemInfo(job.bag, job.slot)
     if not info or info.itemID ~= job.itemID then return end
     if info.isLocked then
         job.tries = (job.tries or 0) + 1
-        if job.tries < 40 then queue[#queue + 1] = job end
+        if job.tries < 40 then
+            Push(job)
+        else
+            Print(("%s ist gesperrt und wurde übersprungen."):format(info.hyperlink or "Item"))
+        end
         return
     end
 
@@ -188,61 +283,148 @@ local function Step()
         return
     end
 
-    local dBag, dSlot = FindFreeSlot(job.toBank)
+    local dBag, dSlot, room = FindTarget(job.toBank, job.itemID)
     if not dBag then
         Print(job.toBank and "Die Bank ist voll." or "Das Inventar ist voll.")
         StopQueue()
         return
     end
 
-    C.PickupContainerItem(job.bag, job.slot)
+    local count = info.stackCount or 1
+    local partial = room and room < count
+    if partial then
+        C.SplitContainerItem(job.bag, job.slot, room)
+    else
+        C.PickupContainerItem(job.bag, job.slot)
+    end
     C.PickupContainerItem(dBag, dSlot)
 
     if GetCursorInfo() then
-        -- Ziel hat das Item nicht angenommen: diesen Behälter überspringen
+        -- Ziel hat das Item nicht angenommen: Slot bzw. Behälter überspringen
         ClearCursor()
-        badBags[dBag] = true
-        table.insert(queue, 1, job)
+        if room then badSlots[Key(dBag, dSlot)] = true else badBags[dBag] = true end
+        Push(job, true)
         return
     end
 
-    reserved[Key(dBag, dSlot)] = GetTime() + 2
+    job.dest = Key(dBag, dSlot)
+    reserved[job.dest] = GetTime() + 2
+    job.count = count
+    job.partial = partial
     job.deadline = GetTime() + 2
     current = job
 end
 
 local function Enqueue(bag, slot, itemID, toBank)
-    if not bankOpen then
-        Print("Die Bank muss geöffnet sein.")
-        return false
-    end
+    if not bankOpen then return false end
+    if queued[Key(bag, slot)] then return false end
     if not ticker then
         wipe(badBags)
+        wipe(badSlots)
         wipe(reserved)
         ticker = C_Timer.NewTicker(0.05, Step)
     end
-    queue[#queue + 1] = { bag = bag, slot = slot, itemID = itemID, toBank = toBank }
+    Push({ bag = bag, slot = slot, itemID = itemID, toBank = toBank })
     return true
 end
 
-local function MoveCategory(classID, toBank)
+local function RequireBank()
+    if bankOpen then return true end
+    Print("Die Bank muss geöffnet sein.")
+    return false
+end
+
+-- Reiht alle Items der Quellseite ein, auf die pred(info) zutrifft. Liefert die Anzahl.
+local function MoveWhere(toBank, pred)
     local n = 0
     for _, bag in ipairs(toBank and InventoryBags() or BankBags()) do
         for slot = 1, C.GetContainerNumSlots(bag) do
             local info = C.GetContainerItemInfo(bag, slot)
-            if info and info.itemID and ItemClass(info.itemID) == classID then
-                if not Enqueue(bag, slot, info.itemID, toBank) then return end
+            if info and info.itemID and pred(info) and Enqueue(bag, slot, info.itemID, toBank) then
                 n = n + 1
             end
         end
     end
+    return n
+end
+
+local function Report(n, what, toBank)
     if n > 0 then
-        Print(("%dx %s >> %s"):format(n, ClassName(classID), toBank and "Bank" or "Inventar"))
+        Print(("%dx %s >> %s"):format(n, what, toBank and "Bank" or "Inventar"))
     end
 end
 
+local function MoveCategory(classID, toBank)
+    if not RequireBank() then return end
+    local n = MoveWhere(toBank, function(info)
+        return ItemClass(info.itemID) == classID and MatchesSearch(info)
+    end)
+    Report(n, ClassName(classID), toBank)
+end
+
+local function MoveSearchResults(toBank)
+    if not RequireBank() then return end
+    Report(MoveWhere(toBank, MatchesSearch), ('"%s"'):format(searchText), toBank)
+end
+
 ---------------------------------------------------------------------------
--- UI
+-- Regeln
+---------------------------------------------------------------------------
+
+local function RunRules(list)
+    if not RequireBank() then return end
+    local total = 0
+    for _, rule in ipairs(list) do
+        if rule.enabled ~= false and rule.types and next(rule.types) then
+            local n = MoveWhere(rule.toBank, function(info)
+                return rule.types[ItemClass(info.itemID)]
+            end)
+            Report(n, rule.name, rule.toBank)
+            total = total + n
+        end
+    end
+    if total == 0 then Print("Regeln: nichts zu verschieben.") end
+end
+
+---------------------------------------------------------------------------
+-- UI-Bausteine
+---------------------------------------------------------------------------
+
+local function CreateCheck(parent, label)
+    local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+    cb:SetSize(24, 24)
+    cb.label = cb:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    cb.label:SetPoint("LEFT", cb, "RIGHT", 2, 0)
+    cb.label:SetText(label or "")
+    return cb
+end
+
+local function CreateButton(parent, text, width)
+    local b = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
+    b:SetSize(width or 100, 22)
+    b:SetText(text)
+    return b
+end
+
+local function CreateInput(parent, width)
+    local e = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
+    e:SetSize(width, 20)
+    e:SetAutoFocus(false)
+    e:SetScript("OnEscapePressed", e.ClearFocus)
+    e:SetScript("OnEnterPressed", e.ClearFocus)
+    return e
+end
+
+local function CreateScroll(parent, width)
+    local scroll = CreateFrame("ScrollFrame", nil, parent, "UIPanelScrollFrameTemplate")
+    local content = CreateFrame("Frame", nil, scroll)
+    content:SetSize(width, 1)
+    scroll:SetScrollChild(content)
+    return scroll, content
+end
+
+---------------------------------------------------------------------------
+-- Hauptfenster
 ---------------------------------------------------------------------------
 
 local function ItemButton_OnEnter(self)
@@ -256,7 +438,7 @@ end
 
 local function ItemButton_OnClick(self, button)
     if (button == "LeftButton" and IsShiftKeyDown()) or button == "RightButton" then
-        Enqueue(self.bag, self.slot, self.itemID, self.toBank)
+        if RequireBank() then Enqueue(self.bag, self.slot, self.itemID, self.toBank) end
     end
 end
 
@@ -297,17 +479,16 @@ local function CreateHeader(parent, toBank)
     h.text = h:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     h.text:SetPoint("LEFT", 4, 0)
 
-    h.btn = CreateFrame("Button", nil, h, "UIPanelButtonTemplate")
-    h.btn:SetSize(112, 20)
+    h.btn = CreateButton(h, toBank and "Alle >> Bank" or "Alle >> Inventar", 112)
+    h.btn:SetHeight(20)
     h.btn:SetPoint("RIGHT", -2, 0)
-    h.btn:SetText(toBank and "Alle >> Bank" or "Alle >> Inventar")
     h.btn:SetScript("OnClick", function() MoveCategory(h.classID, toBank) end)
     return h
 end
 
 local function CreatePanel(parent, toBank, x)
     local p = CreateFrame("Frame", nil, parent)
-    p:SetPoint("TOPLEFT", x, -56)
+    p:SetPoint("TOPLEFT", x, -88)
     p:SetPoint("BOTTOM", 0, 34)
     p:SetWidth(PANEL_W + 26)
     p.toBank = toBank
@@ -316,13 +497,15 @@ local function CreatePanel(parent, toBank, x)
     p.title = p:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
     p.title:SetPoint("BOTTOMLEFT", p, "TOPLEFT", 2, 6)
 
-    p.scroll = CreateFrame("ScrollFrame", nil, p, "UIPanelScrollFrameTemplate")
+    p.moveHits = CreateButton(p, toBank and "Treffer >> Bank" or "Treffer >> Inventar", 130)
+    p.moveHits:SetHeight(20)
+    p.moveHits:SetPoint("BOTTOMRIGHT", p, "TOPRIGHT", -26, 3)
+    p.moveHits:SetScript("OnClick", function() MoveSearchResults(toBank) end)
+    p.moveHits:Hide()
+
+    p.scroll, p.content = CreateScroll(p, PANEL_W)
     p.scroll:SetPoint("TOPLEFT")
     p.scroll:SetPoint("BOTTOMRIGHT", -26, 0)
-
-    p.content = CreateFrame("Frame", nil, p.scroll)
-    p.content:SetSize(PANEL_W, 1)
-    p.scroll:SetScrollChild(p.content)
 
     p.empty = p:CreateFontString(nil, "OVERLAY", "GameFontDisable")
     p.empty:SetPoint("TOP", p.scroll, "TOP", 0, -40)
@@ -340,7 +523,7 @@ local function UpdatePanel(p)
         for _, bag in ipairs(bags) do
             for slot = 1, C.GetContainerNumSlots(bag) do
                 local info = C.GetContainerItemInfo(bag, slot)
-                if info and info.itemID then
+                if info and info.itemID and MatchesSearch(info) then
                     local classID = ItemClass(info.itemID)
                     if not groups[classID] then
                         groups[classID] = {}
@@ -401,13 +584,15 @@ local function UpdatePanel(p)
     for i = nHdr + 1, #p.headers do p.headers[i]:Hide() end
     p.content:SetHeight(math.max(y, 1))
 
+    p.moveHits:SetShown(searchText ~= "" and nBtn > 0 and bankOpen)
+
     if isBankSide and not bankOpen then
         p.title:SetText(label)
         p.empty:SetText("Bank ist nicht geöffnet.")
         p.empty:Show()
     else
         p.title:SetText(("%s  |cff999999(%d frei)|r"):format(label, CountFree(bags)))
-        p.empty:SetText("Leer.")
+        p.empty:SetText(searchText ~= "" and "Keine Treffer." or "Leer.")
         p.empty:SetShown(nBtn == 0)
     end
 end
@@ -425,9 +610,210 @@ function Refresh()
     end)
 end
 
+---------------------------------------------------------------------------
+-- Regel-Fenster
+---------------------------------------------------------------------------
+
+local RULE_ROW_H, TYPE_ROW_H = 22, 22
+
+local function CreateRulesUI()
+    local f = CreateFrame("Frame", "QuickBankRulesFrame", UIParent, "BasicFrameTemplateWithInset")
+    f:SetSize(580, 480)
+    f:SetFrameStrata("DIALOG")
+    f:SetClampedToScreen(true)
+    f:SetMovable(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", f.StartMoving)
+    f:SetScript("OnDragStop", f.StopMovingOrSizing)
+    f:SetPoint("CENTER")
+
+    local title = f.TitleText or (f.TitleContainer and f.TitleContainer.TitleText)
+    if not title then
+        title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        title:SetPoint("TOP", 0, -5)
+    end
+    title:SetText("QuickBank - Regeln")
+
+    local editIndex -- Index der bearbeiteten Regel, nil = neue Regel
+    local RefreshList, LoadEditor
+
+    -- Linke Seite: Regelliste -------------------------------------------
+    local listLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    listLabel:SetPoint("TOPLEFT", 16, -34)
+    listLabel:SetText("Regeln")
+
+    local listScroll, listContent = CreateScroll(f, 190)
+    listScroll:SetPoint("TOPLEFT", 12, -54)
+    listScroll:SetSize(190, 370)
+    local rows = {}
+
+    local newBtn = CreateButton(f, "Neue Regel", 100)
+    newBtn:SetPoint("BOTTOMLEFT", 14, 14)
+    newBtn:SetScript("OnClick", function() LoadEditor(nil) end)
+
+    local runAllBtn = CreateButton(f, "Alle ausführen", 110)
+    runAllBtn:SetPoint("LEFT", newBtn, "RIGHT", 4, 0)
+    runAllBtn:SetScript("OnClick", function() RunRules(QuickBankDB.rules) end)
+
+    -- Rechte Seite: Editor -----------------------------------------------
+    local X = 240
+
+    local nameLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    nameLabel:SetPoint("TOPLEFT", X, -34)
+    nameLabel:SetText("Name:")
+    local nameBox = CreateInput(f, 250)
+    nameBox:SetPoint("LEFT", nameLabel, "RIGHT", 12, 0)
+
+    local dirLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    dirLabel:SetPoint("TOPLEFT", X, -64)
+    dirLabel:SetText("Richtung:")
+    local dirBank = CreateCheck(f, "Zur Bank")
+    dirBank:SetPoint("LEFT", dirLabel, "RIGHT", 8, 0)
+    local dirInv = CreateCheck(f, "Ins Inventar")
+    dirInv:SetPoint("LEFT", dirBank, "RIGHT", 70, 0)
+    dirBank:SetScript("OnClick", function() dirBank:SetChecked(true); dirInv:SetChecked(false) end)
+    dirInv:SetScript("OnClick", function() dirInv:SetChecked(true); dirBank:SetChecked(false) end)
+
+    local typeLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    typeLabel:SetPoint("TOPLEFT", X, -94)
+    typeLabel:SetText("Item-Typen:")
+
+    local allBtn = CreateButton(f, "Alle", 60)
+    allBtn:SetHeight(18)
+    allBtn:SetPoint("LEFT", typeLabel, "RIGHT", 10, 0)
+    local noneBtn = CreateButton(f, "Keine", 60)
+    noneBtn:SetHeight(18)
+    noneBtn:SetPoint("LEFT", allBtn, "RIGHT", 4, 0)
+
+    local typeScroll, typeContent = CreateScroll(f, 290)
+    typeScroll:SetPoint("TOPLEFT", X, -114)
+    typeScroll:SetSize(300, 310)
+
+    local typeChecks = {}
+    for i, key in ipairs(AllTypeKeys()) do
+        local cb = CreateCheck(typeContent, ClassName(key))
+        cb:SetPoint("TOPLEFT", 0, -(i - 1) * TYPE_ROW_H)
+        typeChecks[key] = cb
+    end
+    typeContent:SetHeight(#AllTypeKeys() * TYPE_ROW_H)
+
+    allBtn:SetScript("OnClick", function() for _, cb in pairs(typeChecks) do cb:SetChecked(true) end end)
+    noneBtn:SetScript("OnClick", function() for _, cb in pairs(typeChecks) do cb:SetChecked(false) end end)
+
+    local saveBtn = CreateButton(f, "Speichern", 100)
+    saveBtn:SetPoint("BOTTOMLEFT", X, 14)
+    local deleteBtn = CreateButton(f, "Löschen", 90)
+    deleteBtn:SetPoint("LEFT", saveBtn, "RIGHT", 4, 0)
+    local runBtn = CreateButton(f, "Ausführen", 100)
+    runBtn:SetPoint("LEFT", deleteBtn, "RIGHT", 4, 0)
+
+    function LoadEditor(index)
+        editIndex = index
+        local rule = index and QuickBankDB.rules[index]
+        nameBox:SetText(rule and rule.name or "")
+        local toBank = not rule or rule.toBank
+        dirBank:SetChecked(toBank)
+        dirInv:SetChecked(not toBank)
+        for key, cb in pairs(typeChecks) do
+            cb:SetChecked(rule and rule.types[key] or false)
+        end
+        deleteBtn:SetEnabled(rule ~= nil)
+        runBtn:SetEnabled(rule ~= nil)
+        RefreshList()
+    end
+
+    saveBtn:SetScript("OnClick", function()
+        local name = nameBox:GetText():match("^%s*(.-)%s*$")
+        if name == "" then Print("Bitte einen Namen eingeben.") return end
+        local types = {}
+        for key, cb in pairs(typeChecks) do
+            if cb:GetChecked() then types[key] = true end
+        end
+        if not next(types) then Print("Bitte mindestens einen Item-Typ auswählen.") return end
+
+        local rules = QuickBankDB.rules
+        local rule = editIndex and rules[editIndex]
+        if not rule then
+            rule = { enabled = true }
+            rules[#rules + 1] = rule
+            editIndex = #rules
+        end
+        rule.name, rule.toBank, rule.types = name, dirBank:GetChecked() and true or false, types
+        Print(('Regel "%s" gespeichert.'):format(name))
+        LoadEditor(editIndex)
+    end)
+
+    deleteBtn:SetScript("OnClick", function()
+        if not editIndex then return end
+        local rule = table.remove(QuickBankDB.rules, editIndex)
+        Print(('Regel "%s" gelöscht.'):format(rule.name))
+        LoadEditor(nil)
+    end)
+
+    runBtn:SetScript("OnClick", function()
+        local rule = editIndex and QuickBankDB.rules[editIndex]
+        if rule then RunRules({ { name = rule.name, toBank = rule.toBank, types = rule.types } }) end
+    end)
+
+    function RefreshList()
+        local rules = QuickBankDB.rules
+        for i, rule in ipairs(rules) do
+            local row = rows[i]
+            if not row then
+                row = CreateFrame("Button", nil, listContent)
+                row:SetSize(180, RULE_ROW_H)
+                row:SetPoint("TOPLEFT", 0, -(i - 1) * RULE_ROW_H)
+                row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
+                row.sel = row:CreateTexture(nil, "BACKGROUND")
+                row.sel:SetAllPoints()
+                row.sel:SetColorTexture(1, 0.82, 0, 0.15)
+                row.check = CreateCheck(row)
+                row.check:SetPoint("LEFT", 0, 0)
+                row.check:SetScript("OnClick", function(cb)
+                    QuickBankDB.rules[row.index].enabled = cb:GetChecked() and true or false
+                end)
+                row.check:SetScript("OnEnter", function(cb)
+                    GameTooltip:SetOwner(cb, "ANCHOR_RIGHT")
+                    GameTooltip:SetText("Bei \"Aufräumen\" anwenden")
+                    GameTooltip:Show()
+                end)
+                row.check:SetScript("OnLeave", GameTooltip_Hide)
+                row.text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+                row.text:SetPoint("LEFT", 26, 0)
+                row.text:SetPoint("RIGHT", -2, 0)
+                row.text:SetJustifyH("LEFT")
+                row:SetScript("OnClick", function() LoadEditor(row.index) end)
+                rows[i] = row
+            end
+            row.index = i
+            row.check:SetChecked(rule.enabled ~= false)
+            row.text:SetText(("%s |cff999999>> %s|r"):format(rule.name, rule.toBank and "Bank" or "Inventar"))
+            row.sel:SetShown(i == editIndex)
+            row:Show()
+        end
+        for i = #rules + 1, #rows do rows[i]:Hide() end
+        listContent:SetHeight(math.max(#rules * RULE_ROW_H, 1))
+    end
+
+    f:SetScript("OnShow", function() LoadEditor(nil) end)
+    tinsert(UISpecialFrames, "QuickBankRulesFrame")
+    f:Hide()
+    return f
+end
+
+local function ToggleRules()
+    rulesFrame = rulesFrame or CreateRulesUI()
+    rulesFrame:SetShown(not rulesFrame:IsShown())
+end
+
+---------------------------------------------------------------------------
+-- Hauptfenster aufbauen
+---------------------------------------------------------------------------
+
 local function CreateUI()
     frame = CreateFrame("Frame", "QuickBankFrame", UIParent, "BasicFrameTemplateWithInset")
-    frame:SetSize(PANEL_W * 2 + 26 * 2 + 44, 520)
+    frame:SetSize(PANEL_W * 2 + 26 * 2 + 44, 560)
     frame:SetFrameStrata("HIGH")
     frame:SetClampedToScreen(true)
     frame:SetMovable(true)
@@ -455,6 +841,32 @@ local function CreateUI()
     end
     title:SetText("QuickBank")
 
+    -- Obere Leiste: Suche, Regeln, Aufräumen
+    local searchLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    searchLabel:SetPoint("TOPLEFT", 18, -36)
+    searchLabel:SetText("Suche:")
+
+    local searchBox = CreateInput(frame, 220)
+    searchBox:SetPoint("LEFT", searchLabel, "RIGHT", 10, 0)
+    searchBox:SetScript("OnTextChanged", function(self)
+        searchText = self:GetText():lower():match("^%s*(.-)%s*$")
+        Refresh()
+    end)
+
+    local tidyBtn = CreateButton(frame, "Aufräumen", 100)
+    tidyBtn:SetPoint("TOPRIGHT", -16, -30)
+    tidyBtn:SetScript("OnClick", function() RunRules(QuickBankDB.rules) end)
+    tidyBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+        GameTooltip:SetText("Wendet alle aktiven Regeln an")
+        GameTooltip:Show()
+    end)
+    tidyBtn:SetScript("OnLeave", GameTooltip_Hide)
+
+    local rulesBtn = CreateButton(frame, "Regeln", 80)
+    rulesBtn:SetPoint("RIGHT", tidyBtn, "LEFT", -4, 0)
+    rulesBtn:SetScript("OnClick", ToggleRules)
+
     bankPanel = CreatePanel(frame, false, 14)
     invPanel = CreatePanel(frame, true, 14 + PANEL_W + 26 + 16)
 
@@ -478,6 +890,7 @@ events:SetScript("OnEvent", function(self, event, arg1)
         if arg1 ~= ADDON then return end
         QuickBankDB = QuickBankDB or {}
         if QuickBankDB.autoOpen == nil then QuickBankDB.autoOpen = true end
+        QuickBankDB.rules = QuickBankDB.rules or {}
         CreateUI()
         self:UnregisterEvent("ADDON_LOADED")
         for _, ev in ipairs({ "BANKFRAME_OPENED", "BANKFRAME_CLOSED", "BAG_UPDATE_DELAYED",
@@ -509,6 +922,8 @@ SlashCmdList.QUICKBANK = function(msg)
         QuickBankDB.pos = nil
         frame:ClearAllPoints()
         frame:SetPoint("CENTER")
+    elseif msg == "regeln" or msg == "rules" then
+        ToggleRules()
     else
         frame:SetShown(not frame:IsShown())
     end
